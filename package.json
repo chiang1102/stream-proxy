@@ -1,0 +1,11 @@
+{
+  "name": "stream-proxy-workers",
+  "version": "1.0.0",
+  "description": "Proxy streaming with token validation and failover",
+  "main": "index.js",
+  "scripts": {
+    "deploy": "wrangler publish",
+    "dev": "wrangler dev"
+  },
+  "license": "MIT"
+}
