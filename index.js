@@ -1,134 +1,161 @@
+// Cloudflare Workers IPTV Proxy
 export default {
   async fetch(request, env, ctx) {
-    const { searchParams, pathname } = new URL(request.url);
-    const serverIPs = [
-      '50.7.234.10',
-      '50.7.92.106',
-      '50.7.220.170',
-      '67.159.6.34',
-      '198.16.100.186'
-    ];
-    const id = searchParams.get('id') || '';
-    const ts = searchParams.get('ts') || '';
-    let token = searchParams.get('token') || '';
-    const cookies = parseCookies(request.headers.get('Cookie') || '');
-    const now = Math.floor(Date.now() / 1000);
-    let tokenValid = false;
-    const tokenCookie = cookies['token'];
-    const tokenTimeCookie = cookies['token_time'];
-    if (token && tokenCookie && token === tokenCookie && (now - Number(tokenTimeCookie)) <= 2400) {
-      tokenValid = true;
-    } else {
-      token = await generateSecureToken();
-    }
-    const selectedIP = selectServer(serverIPs, id);
-    const baseUrl = `http://${selectedIP}:8278/${id}`;
-    if (!tokenValid) {
-      const redirectUrl = `${pathname}?id=${encodeURIComponent(id)}&token=${token}`;
-      return new Response('', {
-        status: 302,
-        headers: {
-          'Set-Cookie': `token=${token}; Path=/; HttpOnly; Secure`,
-          'Set-Cookie': `token_time=${now}; Path=/; HttpOnly; Secure`,
-          'Location': redirectUrl
-        }
-      });
-    }
-    if (ts) {
-      const url = `${baseUrl}/${ts}`;
-      const result = await getWithParallelFailover(url, serverIPs, id, ts);
-      return new Response(result.body, { status: result.status });
-    } else {
-      let url = `${baseUrl}/playlist.m3u8`;
-      const seed = "tvata nginx auth module";
-      const path = new URL(url).pathname;
-      const tid = "mc42afe745533";
-      const t = Math.floor(now / 150).toString();
-      const tsum = await md5(seed + path + tid + t);
-      url += `?tid=${tid}&ct=${t}&tsum=${tsum}`;
-      const result = await getWithParallelFailover(url, serverIPs, id);
-      const text = await result.body.text();
-      if (!text || text.includes("404 Not Found")) {
-        return Response.redirect('http://vjs.zencdn.net/v/oceans.mp4', 302);
-      }
-      if (text.includes('EXTM3U')) {
-        const lines = text.split('\n');
-        let modified = '';
-        for (const line of lines) {
-          if (line.includes('.ts')) {
-            const urlSelf = new URL(request.url);
-            modified += `${urlSelf.pathname}?id=${id}&ts=${line}&token=${token}\n`;
-          } else if (line.trim() !== '') {
-            modified += line + '\n';
-          }
-        }
-        return new Response(modified, { headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } });
+    const url = new URL(request.url);
+    const params = Object.fromEntries(url.searchParams);
+
+    try {
+      if (params.action === "clear_cache") {
+        return new Response("🚫 清除快取功能在 Workers 中需使用 Durable Objects 或 KV 實作，暫未支援", { status: 501 });
+      } else if (!params.id) {
+        return await generateChannelList(params);
       } else {
-        return new Response(text, { headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } });
+        return await handleChannelRequest(params);
       }
+    } catch (e) {
+      return new Response("系統維護中，錯誤：" + e.message, { status: 503 });
     }
   }
 };
-async function generateSecureToken() {
-  const array = new Uint8Array(16);
-  crypto.getRandomValues(array);
-  return Array.from(array).map(b => b.toString(16).padStart(2, '0')).join('');
+
+const CONFIG = {
+  upstream: [
+    'http://198.16.100.186:8278/',
+    'http://50.7.92.106:8278/',
+    'http://50.7.234.10:8278/',
+    'http://50.7.220.170:8278/',
+    'http://67.159.6.34:8278/'
+  ],
+  list_url: 'https://cdn.jsdelivr.net/gh/hostemail/cdn@main/live/smart.txt',
+  backup_url: 'https://tv.alishare.cf/live/smart.txt',
+  token_ttl: 2400,
+  fallback: 'http://vjs.zencdn.net/v/oceans.mp4',
+  clear_key: 'leifeng'
+};
+
+let upstreamIndex = 0;
+function getUpstream() {
+  return CONFIG.upstream[upstreamIndex++ % CONFIG.upstream.length];
 }
-function selectServer(servers, name = '') {
-  if (name) {
-    const index = crc32(name) % servers.length;
-    return servers[index];
+
+function getChannelLogo(name) {
+  if (!name) return "https://cdn.jsdelivr.net/gh/hostemail/cdn@main/images/leifeng.png";
+  name = name.replace(/\s*_?HD$/i, '').replace(/\s*高清$/u, '').replace(/[\W_]+/ug, '').trim();
+  return name ? `https://epg.v1.mk/logo/${name}.png` : "https://cdn.jsdelivr.net/gh/hostemail/cdn@main/images/leifeng.png";
+}
+
+async function fetchText(url) {
+  const res = await fetch(url, { headers: { 'Cache-Control': 'no-cache' } });
+  return res.ok ? await res.text() : null;
+}
+
+async function getChannelList() {
+  const raw = await fetchText(CONFIG.list_url) || await fetchText(CONFIG.backup_url);
+  if (!raw) throw new Error("無法讀取任何頻道清單來源");
+  return parseChannelData(raw);
+}
+
+function parseChannelData(raw) {
+  const lines = raw.trim().split(/\n+/);
+  let group = "默認分組", seen = new Set(), list = [];
+  for (const line of lines) {
+    if (line.includes('#genre#')) {
+      group = line.split(',')[0].trim();
+      continue;
+    }
+    const [rawName, url] = line.split(',', 2);
+    if (!rawName || !url) continue;
+
+    let name = rawName.includes('|') ? rawName.split('|')[1] : rawName;
+    name = name.replace(/\s*backup\s*/ig, '').replace(/[^一-龥\w\s\-+]/ug, '').trim();
+    const idMatch = url.match(/(?:[?&:]id=|^)([\w-]+)/);
+    const id = idMatch ? idMatch[1] : null;
+    if (id && !seen.has(id)) {
+      list.push({ id, name, group, logo: getChannelLogo(name) });
+      seen.add(id);
+    }
   }
-  return servers[Math.floor(Math.random() * servers.length)];
+  return list;
 }
-async function getWithParallelFailover(url, servers, name, path = '') {
-  const fetchPromises = servers.map(ip => {
-    const targetUrl = `http://${ip}:8278/${name}${path ? '/' + path : ''}`;
-    return fetch(targetUrl, {
-      headers: {
-        'CLIENT-IP': '127.0.0.1',
-        'X-FORWARDED-FOR': '127.0.0.1'
+
+function validateToken(token) {
+  const [_, ts] = token?.split(':') || [];
+  return ts && (Date.now() / 1000 - parseInt(ts)) <= CONFIG.token_ttl;
+}
+
+function createToken() {
+  return `${crypto.randomUUID().replace(/-/g, '')}:${Math.floor(Date.now() / 1000)}`;
+}
+
+async function generateChannelList(params) {
+  const type = (params.type || 'm3u').toLowerCase();
+  const channels = await getChannelList();
+  const base = 'https://example.com'; // You should replace with your own domain
+  let output = '';
+
+  if (type === 'txt') {
+    let currentGroup = '';
+    for (const chan of channels) {
+      if (chan.group !== currentGroup) {
+        output += `\n${chan.group},#genre#\n`;
+        currentGroup = chan.group;
       }
-    }).then(res => ({ res, ip })).catch(() => null);
-  });
-  const responses = await Promise.all(fetchPromises);
-  for (const entry of responses) {
-    if (entry && entry.res.ok && entry.res.status !== 404) {
-      return { body: entry.res, status: entry.res.status };
+      output += `${chan.name},${base}/?id=${chan.id}\n`;
     }
-  }
-  return { body: new Response('', { status: 404 }), status: 404 };
-}
-function parseCookies(cookieString) {
-  const cookies = {};
-  cookieString.split(';').forEach(cookie => {
-    const parts = cookie.split('=');
-    if (parts.length === 2) {
-      cookies[parts[0].trim()] = parts[1].trim();
+    return new Response(output.trim(), { headers: { 'Content-Type': 'text/plain' } });
+  } else {
+    output = "#EXTM3U\n";
+    let currentGroup = '';
+    for (const chan of channels) {
+      if (chan.group !== currentGroup) {
+        output += `#EXTINF:-1 group-title=\"${chan.group}\", ===== ${chan.group} =====\n${CONFIG.fallback}\n`;
+        currentGroup = chan.group;
+      }
+      output += `#EXTINF:-1 tvg-id=\"${chan.id}\" tvg-name=\"${chan.name}\" group-title=\"${chan.group}\" tvg-logo=\"${chan.logo}\",${chan.name}\n${base}/?id=${chan.id}\n`;
     }
-  });
-  return cookies;
-}
-function crc32(str) {
-  let crc = 0 ^ (-1);
-  for (let i = 0; i < str.length; i++) {
-    crc = (crc >>> 8) ^ table[(crc ^ str.charCodeAt(i)) & 0xFF];
+    return new Response(output.trim(), { headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } });
   }
-  return (crc ^ (-1)) >>> 0;
 }
-const table = (() => {
-  let c;
-  const table = [];
-  for (let n = 0; n < 256; n++) {
-    c = n;
-    for (let k = 0; k < 8; k++) {
-      c = ((c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1));
+
+async function handleChannelRequest(params) {
+  const id = params.id;
+  const ts = params.ts;
+  const token = params.token;
+  const newToken = token && validateToken(token) ? token : createToken();
+
+  if (ts) {
+    const streamUrl = `${getUpstream()}${id}/${ts}`;
+    const res = await fetch(streamUrl);
+    if (!res.ok) return new Response("Segment Not Found", { status: 404 });
+    const data = await res.arrayBuffer();
+    return new Response(data, {
+      headers: {
+        'Content-Type': 'video/MP2T',
+        'Content-Length': data.byteLength
+      }
+    });
+  } else {
+    const ct = Math.floor(Date.now() / 150000);
+    const tokenHash = await sha256(`tvata nginx auth module/${id}/playlist.m3u8mc42afe745533${ct}`);
+    const m3u8Url = `${getUpstream()}${id}/playlist.m3u8?tid=mc42afe745533&ct=${ct}&tsum=${tokenHash}`;
+    const m3u8 = await fetchText(m3u8Url);
+    if (!m3u8 || m3u8.includes('404 Not Found')) {
+      return Response.redirect(CONFIG.fallback);
     }
-    table.push(c);
+    const base = 'https://example.com'; // Replace with your worker domain
+    const updated = m3u8.replace(/(\S+\.ts)/g, (m, segment) => {
+      return `${base}/?id=${encodeURIComponent(id)}&ts=${encodeURIComponent(segment)}&token=${encodeURIComponent(newToken)}`;
+    });
+    return new Response(updated, {
+      headers: {
+        'Content-Type': 'application/vnd.apple.mpegurl'
+      }
+    });
   }
-  return table;
-})();
-async function md5(str) {
-  const buf = await crypto.subtle.digest('MD5', new TextEncoder().encode(str));
-  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function sha256(input) {
+  const msgBuffer = new TextEncoder().encode(input);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+  return [...new Uint8Array(hashBuffer)].map(x => x.toString(16).padStart(2, '0')).join('');
 }
